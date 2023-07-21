@@ -1,48 +1,78 @@
 from typing import Any, Dict, Optional, Tuple
 
+import operator
+from functools import reduce
+
 import torch
+import tqdm
 from lightning import LightningDataModule
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
 from torchvision.transforms import transforms
 
+from transformers import AutoTokenizer
 from datasets import load_dataset
 
-# class DACSDataset(Dataset):
-    
-#     """DACS (differential addition chains) dataset."""
-
-#     def __init__(self, csv_file, root_dir, transform=None):
-#         """
-#         Arguments:
-#             csv_file (string): Path to the csv file with annotations.
-#             root_dir (string): Directory with all the images.
-#             transform (callable, optional): Optional transform to be applied
-#                 on a sample.
-#         """
-
-#         self.data = load_dataset("src/data/scripts/dacs_dataset_script.py")#, data_files="../../../data/dacs.txt")
 
 
-#     def __len__(self):
-#         return len(self.data)
 
-#     def __getitem__(self, idx):
-#         if torch.is_tensor(idx):
-#             idx = idx.tolist()
 
-#         img_name = os.path.join(self.root_dir,
-#                                 self.landmarks_frame.iloc[idx, 0])
-#         image = io.imread(img_name)
-#         landmarks = self.landmarks_frame.iloc[idx, 1:]
-#         landmarks = np.array([landmarks])
-#         landmarks = landmarks.astype('float').reshape(-1, 2)
-#         sample = {'image': image, 'landmarks': landmarks}
 
-#         if self.transform:
-#             sample = self.transform(sample)
+class TokenizedDACSDataset(Dataset):
+    def __init__(self, 
+                 tokenizer, 
+                 max_len_inp=32,
+                 max_len_out=256):
 
-#         return sample
+        self.data = load_dataset("src/data/scripts/dacs_dataset_script.py")
 
+        self.max_len_input = max_len_inp
+        self.max_len_output = max_len_out
+        self.tokenizer = tokenizer
+
+        self.tokenized_data = self.data['train'].map(self.build_tokenized_samples, batched=True, remove_columns=self.data['train'].column_names)
+
+
+    def __len__(self):
+        return len(self.tokenized_data)
+
+    def __getitem__(self, index):
+        return self.tokenized_data[index]
+
+        
+
+    def build_tokenized_samples(self, examples):
+
+        inputs = [(f"Number: {number}  DACS Chain: ", f"Number: {number}  DACS Sequence: ") for number in examples['number']] 
+        inputs = reduce(operator.concat, inputs)
+        targets = [(chain, sequence) for chain, sequence in zip(examples['chain'], examples['sequence'])]
+        targets = reduce(operator.concat, targets)
+
+        tokenized_inputs = self.tokenizer.batch_encode_plus(
+                inputs, max_length=self.max_len_input,
+                truncation = True,
+                padding='max_length', return_tensors="pt"
+            )
+
+        tokenized_targets = self.tokenizer.batch_encode_plus(
+                targets, max_length=self.max_len_output,
+                truncation = True,
+                padding='max_length',return_tensors="pt"
+            )
+
+        labels = tokenized_targets["input_ids"].clone()
+        labels[labels==50256] = -100
+        tokenized_inputs["labels"] = labels
+
+        return tokenized_inputs
+            
+
+def collate_tensor_fn(batch):
+    input_ids = torch.stack([torch.tensor(x['input_ids']) for x in batch])
+    attention_mask = torch.stack([torch.tensor(x['attention_mask']) for x in batch])
+    labels = torch.stack([torch.tensor(x['labels']) for x in batch])
+    return {'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels}
 
 
 
@@ -76,21 +106,21 @@ class DACSDataModule(LightningDataModule):
     def __init__(
         self,
         data_dir: str = "data/",
+        checkpoint: str = "Salesforce/codet5p-2b",
         train_val_test_split: Tuple[int, int, int] = (55_000, 5_000, 10_000),
         batch_size: int = 64,
         num_workers: int = 0,
         pin_memory: bool = False,
+        max_len_input: int = 32,
+        max_len_output: int = 256
     ):
         super().__init__()
+
+        self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
 
         # this line allows to access init params with 'self.hparams' attribute
         # also ensures init params will be stored in ckpt
         self.save_hyperparameters(logger=False)
-
-        # data transformations
-        self.transforms = transforms.Compose(
-            [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
-        )
 
         self.data_train: Optional[Dataset] = None
         self.data_val: Optional[Dataset] = None
@@ -116,18 +146,18 @@ class DACSDataModule(LightningDataModule):
             #        "chain": datasets.Value("string"),
             #        "sequence": datasets.Value("string"}
             
-            dataset = load_dataset("src/data/scripts/dacs_dataset_script.py")#, data_files="../../../data/dacs.txt")
-
-            #dataset = DACSDataset() 
+            dataset = TokenizedDACSDataset(tokenizer = self.tokenizer) 
             
             
             
             
             self.data_train, self.data_val, self.data_test = random_split(
-                dataset=dataset['train'],
+                dataset=dataset ,
                 lengths=self.hparams.train_val_test_split,
                 generator=torch.Generator().manual_seed(42),
             )
+
+
 
     def train_dataloader(self):
         return DataLoader(
@@ -136,6 +166,7 @@ class DACSDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=True,
+            collate_fn=collate_tensor_fn, drop_last=True
         )
 
     def val_dataloader(self):
@@ -145,6 +176,8 @@ class DACSDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
+            collate_fn=collate_tensor_fn,
+            drop_last=True
         )
 
     def test_dataloader(self):
@@ -154,6 +187,8 @@ class DACSDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
+            collate_fn=collate_tensor_fn,
+            drop_last=True
         )
 
     def teardown(self, stage: Optional[str] = None):

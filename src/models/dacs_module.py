@@ -5,6 +5,8 @@ from lightning import LightningModule
 from torchmetrics import MaxMetric, MeanMetric
 from torchmetrics.classification.accuracy import Accuracy
 
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
 
 class DACSLitModule(LightningModule):
     """LightningModule for DACS generation.
@@ -23,17 +25,20 @@ class DACSLitModule(LightningModule):
 
     def __init__(
         self,
-        net: torch.nn.Module,
+        
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler,
+        checkpoint: str = "Salesforce/codet5p-2b"
     ):
         super().__init__()
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(checkpoint,
+                                              torch_dtype=torch.float16,
+                                              trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
 
         # this line allows to access init params with 'self.hparams' attribute
         # also ensures init params will be stored in ckpt
         self.save_hyperparameters(logger=False)
-
-        self.net = net
 
         # loss function
         self.criterion = torch.nn.CrossEntropyLoss()
@@ -51,8 +56,18 @@ class DACSLitModule(LightningModule):
         # for tracking best so far validation accuracy
         self.val_acc_best = MaxMetric()
 
-    def forward(self, x: torch.Tensor):
-        return self.net(x)
+    def forward(self, 
+                input_ids, 
+                attention_mask=None, 
+                #decoder_attention_mask=None, 
+                labels=None):
+
+        return self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
+
 
     def on_train_start(self):
         # by default lightning executes validation step sanity checks before training starts,
@@ -63,23 +78,19 @@ class DACSLitModule(LightningModule):
 
     def model_step(self, batch: Any):
         # batch: number, chain, sequence
-        # generate 2 samples per number
-        x = [(n+'[chain]', n+'[seq]') for n in batch['number']]
-        y = zip(batch['chain'], batch['sequence'])
-        y = [elem for tuple in list(y) for elem in tuple]
-        logits = self.forward(x)
-        loss = self.criterion(logits, y)
-        preds = torch.argmax(logits, dim=1)
-        return loss, preds, y
+        outputs = self.model(**batch)
+        return outputs
+        #loss = outputs[0]
+        #return loss
 
     def training_step(self, batch: Any, batch_idx: int):
-        loss, preds, targets = self.model_step(batch)
-
+        outputs = self.model_step(batch)
+        loss = outputs[0]
         # update and log metrics
         self.train_loss(loss)
-        self.train_acc(preds, targets)
+        #self.train_acc(preds, targets)
         self.log("train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
+        #self.log("train/acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
 
         # return loss or backpropagation will fail
         return loss
@@ -88,13 +99,14 @@ class DACSLitModule(LightningModule):
         pass
 
     def validation_step(self, batch: Any, batch_idx: int):
-        loss, preds, targets = self.model_step(batch)
+        outputs = self.model_step(batch)
+        loss = outputs[0]
 
         # update and log metrics
         self.val_loss(loss)
-        self.val_acc(preds, targets)
+        #self.val_acc(preds, targets)
         self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/acc", self.val_acc, on_step=False, on_epoch=True, prog_bar=True)
+        #self.log("val/acc", self.val_acc, on_step=False, on_epoch=True, prog_bar=True)
 
     def on_validation_epoch_end(self):
         acc = self.val_acc.compute()  # get current val acc
